@@ -48,6 +48,7 @@ import org.ehcache.clustered.server.ServerSideServerStore;
 import org.ehcache.clustered.server.ServerStoreCompatibility;
 import org.ehcache.clustered.server.internal.messages.EhcacheDataSyncMessage;
 import org.ehcache.clustered.server.internal.messages.EhcacheMessageTrackerMessage;
+import org.ehcache.clustered.server.internal.messages.EhcacheSyncMessage;
 import org.ehcache.clustered.server.internal.messages.PassiveReplicationMessage;
 import org.ehcache.clustered.server.internal.messages.PassiveReplicationMessage.ClearInvalidationCompleteMessage;
 import org.ehcache.clustered.server.internal.messages.PassiveReplicationMessage.InvalidationCompleteMessage;
@@ -76,16 +77,23 @@ import org.terracotta.entity.ServiceException;
 import org.terracotta.entity.ServiceRegistry;
 import org.terracotta.entity.StateDumpCollector;
 
+import java.awt.SystemTray;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -586,6 +594,9 @@ public class ClusterTierActiveEntity implements ActiveServerEntity<EhcacheEntity
   @Override
   public void synchronizeKeyToPassive(PassiveSynchronizationChannel<EhcacheEntityMessage> syncChannel, int concurrencyKey) {
     LOGGER.info("Sync started for concurrency key {}.", concurrencyKey);
+    AtomicLong chainNanos = new AtomicLong(0L);
+    AtomicLong bufferNanos = new AtomicLong(0L);
+    AtomicLong mappingNanos = new AtomicLong(0L);
     if (concurrencyKey == DEFAULT_KEY) {
       stateService.getStateRepositoryManager().syncMessageFor(storeIdentifier).forEach(syncChannel::synchronizeToPassive);
     } else {
@@ -594,33 +605,70 @@ public class ClusterTierActiveEntity implements ActiveServerEntity<EhcacheEntity
       AtomicLong size = new AtomicLong(0);
       ServerSideServerStore store = stateService.getStore(storeIdentifier);
       final AtomicReference<Map<Long, Chain>> mappingsToSend = new AtomicReference<>(new HashMap<>());
-      store.getSegmentKeySets().get(segmentId)
-        .forEach(key -> {
-          final Chain chain;
-          try {
-            chain = store.get(key);
-          } catch (TimeoutException e) {
-            throw new AssertionError("Server side store is not expected to throw timeout exception");
-          }
-          for (Element element : chain) {
-            size.addAndGet(element.getPayload().remaining());
-          }
-          mappingsToSend.get().put(key, chain);
-          if (size.get() > dataSizeThreshold) {
-            syncChannel.synchronizeToPassive(new EhcacheDataSyncMessage(mappingsToSend.get()));
+      Queue<EhcacheDataSyncMessage> messages = new ConcurrentLinkedQueue<>();
+      CompletableFuture.runAsync(() -> {
+        try {
+          AtomicLong beginTime = new AtomicLong(System.nanoTime());
+          store.getSegmentKeySets().get(segmentId)
+            .forEach(key -> {
+              final Chain chain;
+              try {
+                long start = System.nanoTime();
+                chain = store.get(key);
+                chainNanos.addAndGet(System.nanoTime() - start);
+              } catch (TimeoutException e) {
+                throw new AssertionError("Server side store is not expected to throw timeout exception");
+              }
+              long start = System.nanoTime();
+              for (Element element : chain) {
+                size.addAndGet(element.getPayload().remaining());
+              }
+              bufferNanos.addAndGet(System.nanoTime() - start);
+              mappingsToSend.get().put(key, chain);
+              if (size.get() > dataSizeThreshold) {
+                messages.offer(new EhcacheDataSyncMessage(mappingsToSend.get()));
+                //syncChannel.synchronizeToPassive(new EhcacheDataSyncMessage(mappingsToSend.get()));
+                mappingsToSend.set(new HashMap<>());
+                size.set(0);
+                long currentTime = System.nanoTime();
+                mappingNanos.addAndGet(currentTime - beginTime.get());
+                beginTime.set(currentTime);
+              }
+            });
+          if (!mappingsToSend.get().isEmpty()) {
+            messages.offer(new EhcacheDataSyncMessage(mappingsToSend.get()));
+            //syncChannel.synchronizeToPassive(new EhcacheDataSyncMessage(mappingsToSend.get()));
             mappingsToSend.set(new HashMap<>());
             size.set(0);
+            long currentTime = System.nanoTime();
+            mappingNanos.addAndGet(currentTime - beginTime.get());
+            beginTime.set(currentTime);
           }
-        });
-      if (!mappingsToSend.get().isEmpty()) {
-        syncChannel.synchronizeToPassive(new EhcacheDataSyncMessage(mappingsToSend.get()));
-        mappingsToSend.set(new HashMap<>());
-        size.set(0);
+        } finally {
+          messages.offer(new LastDataSyncMessage());
+        }
+      });
+      boolean done = false;
+      while (!done) {
+        EhcacheDataSyncMessage e = messages.poll();
+        if (e == null) {
+          Thread.yield();
+          continue;
+        }
+        if (e instanceof LastDataSyncMessage) {
+          done = true;
+        } else {
+          syncChannel.synchronizeToPassive(e);
+        }
       }
     }
+
     sendMessageTrackerReplication(syncChannel, concurrencyKey - 1);
 
-    LOGGER.info("Sync complete for concurrency key {}.", concurrencyKey);
+    LOGGER.info("Sync complete for concurrency key {}, {}, {}, {}.", concurrencyKey,
+      TimeUnit.NANOSECONDS.toSeconds(chainNanos.get()),
+      TimeUnit.NANOSECONDS.toSeconds(bufferNanos.get()),
+      TimeUnit.NANOSECONDS.toSeconds(mappingNanos.get()));
   }
 
   private void sendMessageTrackerReplication(PassiveSynchronizationChannel<EhcacheEntityMessage> syncChannel, int concurrencyKey) {
@@ -652,6 +700,13 @@ public class ClusterTierActiveEntity implements ActiveServerEntity<EhcacheEntity
 
   private boolean isStrong() {
     return this.configuration.getConsistency() == Consistency.STRONG;
+  }
+
+  private static final class LastDataSyncMessage extends EhcacheDataSyncMessage {
+
+    LastDataSyncMessage() {
+      super(Collections.emptyMap());
+    }
   }
 
   static class InvalidationHolder {
